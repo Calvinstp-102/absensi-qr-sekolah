@@ -1,4 +1,4 @@
-import { writeFile, unlink, readFile } from "node:fs/promises";
+import { writeFile, unlink, readFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -10,6 +10,7 @@ export async function savePhoto(
     buffer: Buffer,
     ext: string,
 ) {
+    await mkdir(join(PHOTO_DIR, type), { recursive: true });
     const filename = `${uuid}.${ext}`;
     await writeFile(join(PHOTO_DIR, type, filename), buffer);
     return filename;
