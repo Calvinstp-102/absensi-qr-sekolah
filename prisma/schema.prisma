@@ -1,0 +1,223 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+enum TeacherRole {
+  superadmin
+  admin
+  guru_piket
+  wali_kelas
+}
+
+enum Gender {
+  L
+  P
+}
+
+enum Jenjang {
+  TK
+  SD
+  SMP
+}
+
+enum StudentStatus {
+  active
+  inactive
+}
+
+enum QrRelatedTo {
+  students
+  teachers
+}
+
+enum QrStatus {
+  active
+  grace_period
+  expired
+}
+
+enum AttendanceStatus {
+  hadir
+  terlambat
+  tidak_hadir
+}
+
+enum AttendanceStatusKoreksi {
+  dimaklumi
+}
+
+enum ClassHistoryAction {
+  masuk_baru
+  naik_kelas
+  pindah_kelas
+}
+
+model Teacher {
+  id           Int      @id @default(autoincrement())
+  uuid         String   @unique @default(uuid())
+  nama         String
+  email        String   @unique
+  noHp         String?  @map("no_hp")
+  fotoPath     String?  @map("foto_path")
+  hasQr        Boolean  @default(false) @map("has_qr")
+  passwordHash String   @map("password_hash")
+  role         TeacherRole
+  isActive     Boolean  @default(true) @map("is_active")
+  deleted      Boolean  @default(false)
+  dateCreated  DateTime @default(now()) @map("date_created")
+  dateModified DateTime @updatedAt @map("date_modified")
+
+  correctedAttendances Attendance[]           @relation("AttendanceCorrector")
+  classHistoryChanges  StudentClassHistory[]
+  auditLogs            AuditLog[]
+  qrCodesOwned         QrCode[]               @relation("QrCodeOwner")
+  qrCodesGenerated     QrCode[]               @relation("QrCodeIssuer")
+
+  @@index([role])
+  @@index([deleted])
+  @@map("teachers")
+}
+
+model Student {
+  id              Int           @id @default(autoincrement())
+  uuid            String        @unique @default(uuid())
+  nis             String?       @unique
+  nisn            String?       @unique
+  nama            String
+  gender          Gender
+  tanggalLahir    DateTime?     @map("tanggal_lahir") @db.Date
+  alamat          String?
+  jenjang         Jenjang
+  kelasSekarang   String        @map("kelas_sekarang")
+  namaOrtu        String?       @map("nama_ortu")
+  noHpOrtu        String?       @map("no_hp_ortu")
+  fotoPath        String?       @map("foto_path")
+  hasQr           Boolean       @default(false) @map("has_qr")
+  status          StudentStatus @default(active)
+  statusReason    String?       @map("status_reason")
+  statusChangedAt DateTime?     @map("status_changed_at")
+  deleted         Boolean       @default(false)
+  dateCreated     DateTime      @default(now()) @map("date_created")
+  dateModified    DateTime      @updatedAt @map("date_modified")
+
+  attendances    Attendance[]
+  classHistories StudentClassHistory[]
+  qrCodes        QrCode[]
+
+  @@index([jenjang, kelasSekarang])
+  @@index([status])
+  @@index([deleted])
+  @@map("students")
+}
+
+model QrCode {
+  id               Int         @id @default(autoincrement())
+  uuid             String      @unique @default(uuid())
+  relatedTo        QrRelatedTo @map("related_to")
+  studentId        Int?        @map("student_id")
+  teacherId        Int?        @map("teacher_id")
+  token            String      @unique
+  status           QrStatus    @default(active)
+  generatedAt      DateTime    @default(now()) @map("generated_at")
+  gracePeriodUntil DateTime?   @map("grace_period_until")
+  generatedBy      Int         @map("generated_by")
+  reason           String?
+  deleted          Boolean     @default(false)
+  dateCreated      DateTime    @default(now()) @map("date_created")
+  dateModified     DateTime    @updatedAt @map("date_modified")
+
+  student Student? @relation(fields: [studentId], references: [id])
+  teacher Teacher? @relation("QrCodeOwner", fields: [teacherId], references: [id])
+  issuer  Teacher  @relation("QrCodeIssuer", fields: [generatedBy], references: [id])
+
+  @@index([relatedTo, studentId])
+  @@index([relatedTo, teacherId])
+  @@index([status, deleted])
+  @@map("qr_codes")
+}
+
+model Attendance {
+  id            Int                      @id @default(autoincrement())
+  uuid          String                   @unique @default(uuid())
+  studentId     Int                      @map("student_id")
+  tanggal       DateTime                 @db.Date
+  jamMasukAsli  DateTime?                @map("jam_masuk_asli")
+  jamPulangAsli DateTime?                @map("jam_pulang_asli")
+  statusUtama   AttendanceStatus         @map("status_utama")
+  statusKoreksi AttendanceStatusKoreksi? @map("status_koreksi")
+  alasanKoreksi String?                  @map("alasan_koreksi")
+  dikoreksiOleh Int?                     @map("dikoreksi_oleh")
+  dikoreksiAt   DateTime?                @map("dikoreksi_at")
+  deviceInfo    String?                  @map("device_info")
+  deleted       Boolean                  @default(false)
+  dateCreated   DateTime                 @default(now()) @map("date_created")
+  dateModified  DateTime                 @updatedAt @map("date_modified")
+
+  student Student  @relation(fields: [studentId], references: [id])
+  teacher Teacher? @relation("AttendanceCorrector", fields: [dikoreksiOleh], references: [id])
+
+  @@unique([studentId, tanggal])
+  @@index([tanggal, statusUtama])
+  @@index([deleted])
+  @@map("attendances")
+}
+
+model StudentClassHistory {
+  id           Int                @id @default(autoincrement())
+  uuid         String             @unique @default(uuid())
+  studentId    Int                @map("student_id")
+  kelas        String
+  tahunAjaran  String             @map("tahun_ajaran")
+  action       ClassHistoryAction
+  reason       String?
+  changedBy    Int                @map("changed_by")
+  deleted      Boolean            @default(false)
+  dateCreated  DateTime           @default(now()) @map("date_created")
+  dateModified DateTime           @updatedAt @map("date_modified")
+
+  student Student @relation(fields: [studentId], references: [id])
+  teacher Teacher @relation(fields: [changedBy], references: [id])
+
+  @@index([studentId, tahunAjaran])
+  @@map("student_class_history")
+}
+
+model AuditLog {
+  id           Int      @id @default(autoincrement())
+  uuid         String   @unique @default(uuid())
+  teacherId    Int      @map("teacher_id")
+  actionType   String   @map("action_type")
+  entityType   String   @map("entity_type")
+  entityId     Int      @map("entity_id")
+  beforeValue  Json?    @map("before_value")
+  afterValue   Json?    @map("after_value")
+  reason       String?
+  deleted      Boolean  @default(false)
+  dateCreated  DateTime @default(now()) @map("date_created")
+  dateModified DateTime @updatedAt @map("date_modified")
+
+  teacher Teacher @relation(fields: [teacherId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([teacherId])
+  @@map("audit_logs")
+}
+
+model Settings {
+  id           Int      @id @default(autoincrement())
+  uuid         String   @unique @default(uuid())
+  key          String   @unique
+  value        String
+  description  String?
+  updatedBy    String?  @map("updated_by")
+  deleted      Boolean  @default(false)
+  dateCreated  DateTime @default(now()) @map("date_created")
+  dateModified DateTime @updatedAt @map("date_modified")
+
+  @@map("settings")
+}
