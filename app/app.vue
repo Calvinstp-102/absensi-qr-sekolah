@@ -6,5 +6,13 @@
         </NuxtLayout>
         <ConfirmDialog />
         <LoadingOverlay />
+        <ToastContainer />
     </div>
 </template>
+
+<script setup lang="ts">
+useHead({
+    titleTemplate: (title) =>
+        title ? `${title} - Absensi QR Sekolah` : "Absensi QR Sekolah",
+});
+</script>

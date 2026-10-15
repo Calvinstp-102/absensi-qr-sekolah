@@ -1,55 +1,40 @@
 export default defineEventHandler(async (event) => {
-    const session = await requireUserSession(event);
-    const uuid = getRouterParam(event, "uuid");
-    const teacher = await prisma.teacher.findUnique({ where: { uuid } });
-    if (!teacher) {
-        throw createError({
-            statusCode: 404,
-            statusMessage: "Guru tidak ditemukan",
-        });
-    }
+    const user = await requireAuth(event);
+    const teacher = await findTeacherOr404(event);
+    assertCanEditTeacherPhoto(event, user, teacher);
 
-    const isOwnPhoto = teacher.id === session.user.id;
-    const isSuperadmin = session.user.role === "superadmin";
-    if (!isOwnPhoto && !isSuperadmin) {
-        throw createError({
-            statusCode: 403,
-            statusMessage: "Hanya bisa mengubah foto sendiri",
-        });
-    }
+    const { data, ext } = await readPhotoUpload(event);
 
-    const formData = await readMultipartFormData(event);
-    const file = formData?.find((f) => f.name === "photo");
-    if (!file) {
-        throw createError({
-            statusCode: 400,
-            statusMessage: "File foto tidak ditemukan",
-        });
-    }
-
-    const ext = extFromMimeType(file.type || "");
-    if (!ext) {
-        throw createError({
-            statusCode: 400,
-            statusMessage: "Format file harus JPG, PNG, atau WEBP",
-        });
-    }
-    if (file.data.length > 2 * 1024 * 1024) {
-        throw createError({
-            statusCode: 400,
-            statusMessage: "Ukuran file maksimal 2MB",
-        });
-    }
-
-    if (teacher.fotoPath) {
-        await deletePhoto("teachers", teacher.fotoPath);
-    }
-
-    const filename = await savePhoto("teachers", teacher.uuid, file.data, ext);
-    await prisma.teacher.update({
+    // Nama file unik per upload -> URL foto berubah, browser tidak menampilkan foto lama.
+    // Simpan file baru dulu, baru hapus file lama.
+    const filename = await savePhoto(
+        "teachers",
+        teacher.uuid,
+        data,
+        ext,
+        Date.now().toString(36),
+    );
+    const updated = await prisma.teacher.update({
         where: { id: teacher.id },
         data: { fotoPath: filename },
+        select: teacherPublicSelect,
+    });
+    if (teacher.fotoPath && teacher.fotoPath !== filename) {
+        await deletePhoto("teachers", teacher.fotoPath).catch((e) =>
+            logger.error("guru", "Gagal menghapus file foto lama", { teacherId: teacher.id }, e),
+        );
+    }
+
+    if (teacher.id === user.id) {
+        await refreshOwnSessionUser(event, { fotoPath: filename });
+    }
+
+    logger.info("guru", "Foto guru diperbarui", {
+        ...requestContext(event),
+        teacherId: teacher.id,
+        ukuranKb: Math.round(data.length / 1024),
+        format: ext,
     });
 
-    return { fotoPath: filename };
+    return { teacher: updated, message: "Foto profil berhasil diperbarui." };
 });

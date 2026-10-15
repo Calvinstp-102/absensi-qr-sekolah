@@ -1,18 +1,27 @@
 <template>
     <Teleport to="body">
-        <div
-            v-if="isLoading"
-            class="fixed inset-0 bg-black/30 backdrop-blur-[1px] z-[200] flex items-center justify-center"
+        <Transition
+            enter-active-class="transition-opacity duration-150"
+            leave-active-class="transition-opacity duration-150"
+            enter-from-class="opacity-0"
+            leave-to-class="opacity-0"
         >
+            <!-- Layar diredupkan & semua klik ditahan selama request ke server berjalan -->
             <div
-                class="bg-white rounded-2xl shadow-2xl px-8 py-6 flex flex-col items-center gap-3"
+                v-if="isLoading"
+                class="fixed inset-0 bg-black/50 z-[200] flex items-center justify-center cursor-wait"
+                role="status"
+                aria-live="polite"
+                @click.stop.prevent
             >
-                <div
-                    class="w-10 h-10 border-4 border-gray-200 border-t-primary-600 rounded-full animate-spin"
-                ></div>
-                <p class="text-sm text-gray-500 font-medium">Memproses...</p>
+                <div class="flex flex-col items-center gap-3">
+                    <div
+                        class="w-10 h-10 border-4 border-white/30 border-t-white rounded-full animate-spin"
+                    ></div>
+                    <p class="text-sm text-white font-medium drop-shadow">Memuat...</p>
+                </div>
             </div>
-        </div>
+        </Transition>
     </Teleport>
 </template>
 
