@@ -1,23 +1,34 @@
 export default defineEventHandler(async (event) => {
-    await requireUserSession(event);
-    const uuid = getRouterParam(event, "uuid") as string;
+    await requireAuth(event);
+    const uuid = getRouterParam(event, "uuid");
 
-    const qr = await prisma.qrCode.findUnique({ where: { uuid } });
+    const qr = uuid
+        ? await prisma.qrCode.findUnique({
+              where: { uuid },
+              select: { uuid: true, token: true, deleted: true },
+          })
+        : null;
     if (!qr || qr.deleted) {
-        throw createError({
-            statusCode: 404,
-            statusMessage: "QR tidak ditemukan",
-        });
+        throw appError(404, "QR tidak ditemukan.");
     }
 
+    let buffer: Buffer;
     try {
-        const buffer = await readQrImage(uuid);
-        setResponseHeader(event, "Content-Type", "image/png");
-        return buffer;
+        buffer = await readQrImage(qr.uuid);
     } catch {
-        throw createError({
-            statusCode: 404,
-            statusMessage: "File QR tidak ditemukan",
-        });
+        // File gambar hilang (mis. gagal ditulis / storage dipindah) -> buat ulang dari token
+        try {
+            await saveQrImage(qr.uuid, qr.token);
+            buffer = await readQrImage(qr.uuid);
+            logger.warn("qr", "Gambar QR hilang, dibuat ulang", { qrUuid: qr.uuid });
+        } catch (e) {
+            logger.error("qr", "Gagal membuat ulang gambar QR", { qrUuid: qr.uuid }, e);
+            throw appError(404, "File QR tidak ditemukan.");
+        }
     }
+
+    setResponseHeader(event, "Content-Type", "image/png");
+    // Gambar QR untuk uuid yang sama tidak pernah berubah
+    setResponseHeader(event, "Cache-Control", "private, max-age=86400");
+    return buffer;
 });

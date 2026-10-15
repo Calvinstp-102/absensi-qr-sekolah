@@ -1,56 +1,51 @@
 export default defineEventHandler(async (event) => {
-    const session = await requireUserSession(event);
-    if (session.user.role !== "superadmin") {
-        throw createError({
-            statusCode: 403,
-            statusMessage: "Hanya superadmin yang bisa menghapus guru",
-        });
+    const user = await requireRole(event, SUPERADMIN_ONLY);
+    const teacher = await findTeacherOr404(event);
+
+    if (teacher.id === user.id) {
+        throw appError(400, "Anda tidak dapat menghapus akun sendiri.");
     }
 
-    const uuid = getRouterParam(event, "uuid");
-    const teacher = await prisma.teacher.findUnique({ where: { uuid } });
-    if (!teacher || teacher.deleted) {
-        throw createError({
-            statusCode: 404,
-            statusMessage: "Guru tidak ditemukan",
-        });
-    }
-
-    if (teacher.id === session.user.id) {
-        throw createError({
-            statusCode: 400,
-            statusMessage: "Tidak bisa menghapus akun sendiri",
-        });
-    }
-
-    if (teacher.role === "superadmin") {
-        const activeSuperadminCount = await prisma.teacher.count({
+    if (teacher.role === "superadmin" && teacher.isActive) {
+        const activeSuperadmins = await prisma.teacher.count({
             where: { role: "superadmin", isActive: true, deleted: false },
         });
-        if (activeSuperadminCount <= 1) {
-            throw createError({
-                statusCode: 400,
-                statusMessage: "Tidak bisa menghapus superadmin terakhir",
-            });
+        if (activeSuperadmins <= 1) {
+            throw appError(400, "Superadmin terakhir yang aktif tidak dapat dihapus.");
         }
     }
 
-    await prisma.teacher.update({
-        where: { id: teacher.id },
-        data: { deleted: true },
+    await prisma.$transaction(async (tx) => {
+        await tx.teacher.update({
+            where: { id: teacher.id },
+            data: { deleted: true, sessionVersion: { increment: 1 } },
+        });
+        // Kelas yang dipegang dilepas agar bisa diberikan ke wali lain (Modul 5)
+        await tx.waliKelas.deleteMany({ where: { teacherId: teacher.id } });
+        await tx.auditLog.create({
+            data: {
+                teacherId: user.id,
+                actionType: "delete_teacher",
+                entityType: "teacher",
+                entityId: teacher.id,
+                beforeValue: {
+                    nama: teacher.nama,
+                    email: teacher.email,
+                    role: teacher.role,
+                    deleted: false,
+                },
+                afterValue: { deleted: true },
+                reason: "Guru dihapus oleh superadmin",
+            },
+        });
     });
 
-    await prisma.auditLog.create({
-        data: {
-            teacherId: session.user.id,
-            actionType: "delete_teacher",
-            entityType: "teacher",
-            entityId: teacher.id,
-            beforeValue: { deleted: false },
-            afterValue: { deleted: true },
-            reason: "Guru dihapus oleh admin",
-        },
+    logger.info("guru", "Guru dihapus", {
+        ...requestContext(event),
+        teacherId: teacher.id,
+        email: teacher.email,
+        role: teacher.role,
     });
 
-    return { status: "ok" };
+    return { status: "ok", message: `Akun ${teacher.nama} berhasil dihapus.` };
 });

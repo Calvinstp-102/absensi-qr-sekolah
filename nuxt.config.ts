@@ -5,6 +5,13 @@ export default defineNuxtConfig({
     '@nuxtjs/tailwindcss',
     'nuxt-auth-utils'
   ],
+  runtimeConfig: {
+    session: {
+      // Batas maksimum cookie sesi (untuk "Ingat saya"). Sesi biasa dibatasi 12 jam
+      // di server/utils/auth.ts (requireAuth).
+      maxAge: 60 * 60 * 24 * 30
+    }
+  },
   app: {
     head: {
       link: [

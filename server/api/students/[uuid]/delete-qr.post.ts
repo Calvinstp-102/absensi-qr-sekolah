@@ -1,52 +1,55 @@
-export default defineEventHandler(async (event) => {
-    const session = await requireUserSession(event);
-    const uuid = getRouterParam(event, "uuid");
+import { z } from "zod";
 
-    const student = await prisma.student.findUnique({ where: { uuid } });
-    if (!student) {
-        throw createError({
-            statusCode: 404,
-            statusMessage: "Siswa tidak ditemukan",
-        });
-    }
+const deleteQrSchema = z.object({
+    reason: z
+        .string({ error: "Alasan harus berupa teks." })
+        .trim()
+        .max(255, "Alasan maksimal 255 karakter.")
+        .nullish()
+        .transform((v) => v || "QR dihapus manual"),
+});
+
+export default defineEventHandler(async (event) => {
+    const user = await requireRole(event, ADMIN_ROLES);
+    const body = await parseBody(event, deleteQrSchema);
+    const student = await findStudentOr404(event);
 
     const activeQr = await prisma.qrCode.findFirst({
-        where: {
-            relatedTo: "students",
-            studentId: student.id,
-            status: "active",
-            deleted: false,
-        },
+        where: { relatedTo: "students", studentId: student.id, status: "active", deleted: false },
+        select: { id: true, uuid: true },
     });
     if (!activeQr) {
-        throw createError({
-            statusCode: 400,
-            statusMessage: "Siswa ini tidak memiliki QR aktif",
-        });
+        throw appError(409, "Siswa ini tidak memiliki QR aktif.");
     }
 
-    await prisma.qrCode.update({
-        where: { id: activeQr.id },
-        data: { status: "expired", deleted: true },
-    });
-    await deleteQrImage(activeQr.uuid);
+    // Langsung tidak berlaku (tanpa masa tenggang)
+    await prisma.$transaction([
+        prisma.qrCode.update({
+            where: { id: activeQr.id },
+            data: { status: "expired", deleted: true },
+        }),
+        prisma.student.update({ where: { id: student.id }, data: { hasQr: false } }),
+        prisma.auditLog.create({
+            data: {
+                teacherId: user.id,
+                actionType: "delete_qr",
+                entityType: "student",
+                entityId: student.id,
+                beforeValue: { qrCodeId: activeQr.id },
+                afterValue: { qrCodeId: null },
+                reason: body.reason,
+            },
+        }),
+    ]);
+    await deleteQrImage(activeQr.uuid).catch((e) =>
+        logger.error("qr", "Gagal menghapus gambar QR", { qrId: activeQr.id }, e),
+    );
 
-    await prisma.student.update({
-        where: { id: student.id },
-        data: { hasQr: false },
+    logger.info("qr", "QR siswa dihapus", {
+        ...requestContext(event),
+        studentId: student.id,
+        qrId: activeQr.id,
     });
 
-    await prisma.auditLog.create({
-        data: {
-            teacherId: session.user.id,
-            actionType: "delete_qr",
-            entityType: "student",
-            entityId: student.id,
-            beforeValue: { qrCodeId: activeQr.id },
-            afterValue: { qrCodeId: null },
-            reason: "QR dihapus manual oleh guru",
-        },
-    });
-
-    return { status: "ok" };
+    return { message: "QR dihapus dan tidak bisa dipakai absen lagi." };
 });

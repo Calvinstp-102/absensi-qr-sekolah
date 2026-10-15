@@ -29,3 +29,6 @@ logs
 # File storage (QR & foto — data, bukan source code, jangan ikut ke-commit)
 /storage/qrcodes
 /storage/photos
+
+# Log aplikasi (dibuat otomatis, dihapus setelah 7 hari)
+/storage/logs

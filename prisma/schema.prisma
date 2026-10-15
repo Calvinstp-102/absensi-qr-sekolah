@@ -49,34 +49,50 @@ enum AttendanceStatus {
 
 enum AttendanceStatusKoreksi {
   dimaklumi
+  sakit
+  izin
+}
+
+enum AttendanceMethod {
+  qr
+  manual
 }
 
 enum ClassHistoryAction {
   masuk_baru
   naik_kelas
   pindah_kelas
+  lulus
 }
 
 model Teacher {
-  id           Int      @id @default(autoincrement())
-  uuid         String   @unique @default(uuid())
-  nama         String
-  email        String   @unique
-  noHp         String?  @map("no_hp")
-  fotoPath     String?  @map("foto_path")
-  hasQr        Boolean  @default(false) @map("has_qr")
-  passwordHash String   @map("password_hash")
-  role         TeacherRole
-  isActive     Boolean  @default(true) @map("is_active")
-  deleted      Boolean  @default(false)
-  dateCreated  DateTime @default(now()) @map("date_created")
-  dateModified DateTime @updatedAt @map("date_modified")
+  id             Int         @id @default(autoincrement())
+  uuid           String      @unique @default(uuid())
+  nama           String
+  email          String      @unique
+  noHp           String?     @map("no_hp")
+  fotoPath       String?     @map("foto_path")
+  hasQr          Boolean     @default(false) @map("has_qr")
+  passwordHash   String      @map("password_hash")
+  role           TeacherRole
+  isActive       Boolean     @default(true) @map("is_active")
+  // Dinaikkan saat password/role/status akun berubah -> semua sesi lama otomatis tidak berlaku
+  sessionVersion Int         @default(0) @map("session_version")
+  lastLoginAt    DateTime?   @map("last_login_at")
+  deleted        Boolean     @default(false)
+  dateCreated    DateTime    @default(now()) @map("date_created")
+  dateModified   DateTime    @updatedAt @map("date_modified")
 
-  correctedAttendances Attendance[]           @relation("AttendanceCorrector")
+  correctedAttendances Attendance[]          @relation("AttendanceCorrector")
+  masukAttendances     Attendance[]          @relation("AttendanceMasukOleh")
+  pulangAttendances    Attendance[]          @relation("AttendancePulangOleh")
   classHistoryChanges  StudentClassHistory[]
   auditLogs            AuditLog[]
-  qrCodesOwned         QrCode[]               @relation("QrCodeOwner")
-  qrCodesGenerated     QrCode[]               @relation("QrCodeIssuer")
+  qrCodesOwned         QrCode[]              @relation("QrCodeOwner")
+  qrCodesGenerated     QrCode[]              @relation("QrCodeIssuer")
+  holidaysCreated      Holiday[]             @relation("HolidayCreatedBy")
+  holidaysUpdated      Holiday[]             @relation("HolidayUpdatedBy")
+  waliKelas            WaliKelas[]
 
   @@index([role])
   @@index([deleted])
@@ -154,14 +170,26 @@ model Attendance {
   dikoreksiOleh Int?                     @map("dikoreksi_oleh")
   dikoreksiAt   DateTime?                @map("dikoreksi_at")
   deviceInfo    String?                  @map("device_info")
+  // Cara & pencatat absen masuk/pulang (null = belum ada / dibuat cron)
+  masukMetode   AttendanceMethod?        @map("masuk_metode")
+  masukOleh     Int?                     @map("masuk_oleh")
+  catatanMasuk  String?                  @map("catatan_masuk") @db.VarChar(255)
+  pulangMetode  AttendanceMethod?        @map("pulang_metode")
+  pulangOleh    Int?                     @map("pulang_oleh")
+  catatanPulang String?                  @map("catatan_pulang") @db.VarChar(255)
+  pulangAwal    Boolean                  @default(false) @map("pulang_awal")
+  // true = dianggap belum absen (mis. scan masuk dibatalkan); dihidupkan lagi oleh scan/cron berikutnya
   deleted       Boolean                  @default(false)
   dateCreated   DateTime                 @default(now()) @map("date_created")
   dateModified  DateTime                 @updatedAt @map("date_modified")
 
-  student Student  @relation(fields: [studentId], references: [id])
-  teacher Teacher? @relation("AttendanceCorrector", fields: [dikoreksiOleh], references: [id])
+  student       Student  @relation(fields: [studentId], references: [id])
+  teacher       Teacher? @relation("AttendanceCorrector", fields: [dikoreksiOleh], references: [id])
+  masukTeacher  Teacher? @relation("AttendanceMasukOleh", fields: [masukOleh], references: [id])
+  pulangTeacher Teacher? @relation("AttendancePulangOleh", fields: [pulangOleh], references: [id])
 
   @@unique([studentId, tanggal])
+  @@index([tanggal, deleted])
   @@index([tanggal, statusUtama])
   @@index([deleted])
   @@map("attendances")
@@ -205,6 +233,8 @@ model AuditLog {
 
   @@index([entityType, entityId])
   @@index([teacherId])
+  @@index([dateCreated])
+  @@index([actionType, dateCreated])
   @@map("audit_logs")
 }
 
@@ -220,4 +250,40 @@ model Settings {
   dateModified DateTime @updatedAt @map("date_modified")
 
   @@map("settings")
+}
+
+// Hari libur (rentang tanggal). jenjang null = semua jenjang, selain itu daftar dipisah koma, mis. "SD,SMP"
+model Holiday {
+  id             Int      @id @default(autoincrement())
+  uuid           String   @unique @default(uuid())
+  tanggalMulai   DateTime @map("tanggal_mulai") @db.Date
+  tanggalSelesai DateTime @map("tanggal_selesai") @db.Date
+  keterangan     String   @db.VarChar(150)
+  jenjang        String?  @db.VarChar(20)
+  createdBy      Int?     @map("created_by")
+  updatedBy      Int?     @map("updated_by")
+  deleted        Boolean  @default(false)
+  dateCreated    DateTime @default(now()) @map("date_created")
+  dateModified   DateTime @updatedAt @map("date_modified")
+
+  createdTeacher Teacher? @relation("HolidayCreatedBy", fields: [createdBy], references: [id])
+  updatedTeacher Teacher? @relation("HolidayUpdatedBy", fields: [updatedBy], references: [id])
+
+  @@index([deleted, tanggalMulai, tanggalSelesai])
+  @@map("holidays")
+}
+
+// Penugasan wali kelas (Modul 5): 1 kelas = 1 wali, 1 guru boleh memegang beberapa kelas
+model WaliKelas {
+  id          Int      @id @default(autoincrement())
+  teacherId   Int      @map("teacher_id")
+  jenjang     Jenjang
+  kelas       String   @db.VarChar(20)
+  dateCreated DateTime @default(now()) @map("date_created")
+
+  teacher Teacher @relation(fields: [teacherId], references: [id])
+
+  @@unique([jenjang, kelas])
+  @@index([teacherId])
+  @@map("wali_kelas")
 }

@@ -1,46 +1,54 @@
 import { z } from "zod";
 
-const createStudentSchema = z.object({
-    nama: z.string().min(1),
-    nis: z.string().optional(),
-    nisn: z.string().min(1),
-    gender: z.enum(["L", "P"]),
-    tanggalLahir: z.string().min(1),
-    alamat: z.string().min(1),
-    jenjang: z.enum(["TK", "SD", "SMP"]),
-    kelasSekarang: z.string().min(1),
-    namaOrtu: z.string().min(1),
-    noHpOrtu: z.string().min(1),
-});
+const createStudentSchema = withKelasCheck(z.object(studentFields));
 
 export default defineEventHandler(async (event) => {
-    const session = await requireUserSession(event);
-    const body = await readValidatedBody(event, createStudentSchema.parse);
+    const user = await requireRole(event, ADMIN_ROLES);
+    const body = await parseBody(event, createStudentSchema);
+    await assertNisNisnAvailable(body);
 
-    const student = await prisma.student.create({
-        data: {
-            nama: body.nama,
-            nis: body.nis,
-            nisn: body.nisn,
-            gender: body.gender,
-            tanggalLahir: new Date(body.tanggalLahir),
-            alamat: body.alamat,
-            jenjang: body.jenjang,
-            kelasSekarang: body.kelasSekarang,
-            namaOrtu: body.namaOrtu,
-            noHpOrtu: body.noHpOrtu,
-        },
+    const tahunAjaran = await getSettingValue("tahun_ajaran_aktif");
+
+    const student = await prisma
+        .$transaction(async (tx) => {
+            const s = await tx.student.create({
+                data: body,
+                select: studentListSelect,
+            });
+            await tx.studentClassHistory.create({
+                data: {
+                    studentId: s.id,
+                    kelas: body.kelasSekarang,
+                    tahunAjaran,
+                    action: "masuk_baru",
+                    changedBy: user.id,
+                },
+            });
+            await tx.auditLog.create({
+                data: {
+                    teacherId: user.id,
+                    actionType: "create_student",
+                    entityType: "student",
+                    entityId: s.id,
+                    afterValue: {
+                        nama: s.nama,
+                        nisn: s.nisn,
+                        jenjang: s.jenjang,
+                        kelas: s.kelasSekarang,
+                    },
+                    reason: "Tambah siswa baru",
+                },
+            });
+            return s;
+        })
+        .catch((e) => handlePrismaError(e, STUDENT_UNIQUE_LABELS, body));
+
+    logger.info("siswa", "Siswa ditambahkan", {
+        ...requestContext(event),
+        studentId: student.id,
+        jenjang: student.jenjang,
+        kelas: student.kelasSekarang,
     });
 
-    await prisma.studentClassHistory.create({
-        data: {
-            studentId: student.id,
-            kelas: body.kelasSekarang,
-            tahunAjaran: await getSettingValue("tahun_ajaran_aktif"),
-            action: "masuk_baru",
-            changedBy: session.user.id,
-        },
-    });
-
-    return student;
+    return { student, message: `Siswa ${student.nama} berhasil ditambahkan.` };
 });

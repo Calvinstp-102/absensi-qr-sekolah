@@ -1,33 +1,64 @@
+import { z } from "zod";
+
+const querySchema = withFilterKelasCheck(
+    z.object({
+        ...studentFilterShape,
+        page: z.coerce
+            .number({ error: "Halaman harus berupa angka." })
+            .int("Halaman harus berupa angka bulat.")
+            .min(1, "Halaman minimal 1.")
+            .default(1),
+        pageSize: z.coerce
+            .number({ error: "Jumlah per halaman harus berupa angka." })
+            .int("Jumlah per halaman harus berupa angka bulat.")
+            .min(1, "Jumlah per halaman minimal 1.")
+            .max(100, "Jumlah per halaman maksimal 100.")
+            .default(10),
+    }),
+);
+
 export default defineEventHandler(async (event) => {
-    const query = getQuery(event);
-    const jenjang = query.jenjang as string | undefined;
-    const kelas = query.kelas as string | undefined;
-    const status = query.status as string | undefined;
-    const page = Number(query.page) || 1;
-    const pageSize = Number(query.pageSize) || 5;
+    await requireAuth(event);
+    const query = parseQuery(event, querySchema);
+    const where = buildStudentWhere(query);
 
-    const where = {
-        deleted: false,
-        ...(jenjang && { jenjang: jenjang as any }),
-        ...(kelas && { kelasSekarang: kelas }),
-        ...(status && { status: status as any }),
-    };
+    // Ringkasan mengikuti jenjang/kelas yang dipilih (bukan cari/status/QR),
+    // supaya kartu ringkasan tetap bisa dipakai sebagai filter
+    const scope = buildStudentWhere({ jenjang: query.jenjang, kelas: query.kelas });
 
-    const total = await prisma.student.count({ where });
-    const students = await prisma.student.findMany({
-        where,
-        orderBy: [{ kelasSekarang: "asc" }, { nama: "asc" }],
-        skip: (page - 1) * pageSize,
-        take: pageSize,
-    });
+    const [total, students, groups] = await Promise.all([
+        prisma.student.count({ where }),
+        prisma.student.findMany({
+            where,
+            select: studentListSelect,
+            orderBy: studentOrderBy,
+            skip: (query.page - 1) * query.pageSize,
+            take: query.pageSize,
+        }),
+        prisma.student.groupBy({
+            by: ["status", "hasQr"],
+            where: scope,
+            _count: { _all: true },
+        }),
+    ]);
+
+    const summary = { total: 0, aktif: 0, nonaktif: 0, belumQr: 0 };
+    for (const g of groups) {
+        const n = g._count._all;
+        summary.total += n;
+        if (g.status === "active") summary.aktif += n;
+        else summary.nonaktif += n;
+        if (!g.hasQr) summary.belumQr += n;
+    }
 
     return {
         students,
+        summary,
         pagination: {
-            page,
-            pageSize,
+            page: query.page,
+            pageSize: query.pageSize,
             total,
-            totalPages: Math.max(1, Math.ceil(total / pageSize)),
+            totalPages: Math.max(1, Math.ceil(total / query.pageSize)),
         },
     };
 });

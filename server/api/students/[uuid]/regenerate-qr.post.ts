@@ -1,77 +1,64 @@
 import { z } from "zod";
 
 const regenerateSchema = z.object({
-    reason: z.string().optional(),
+    reason: z
+        .string({ error: "Alasan harus berupa teks." })
+        .trim()
+        .max(255, "Alasan maksimal 255 karakter.")
+        .nullish()
+        .transform((v) => v || ""),
 });
 
 export default defineEventHandler(async (event) => {
-    const session = await requireUserSession(event);
-    const uuid = getRouterParam(event, "uuid");
-    const body = await readValidatedBody(event, regenerateSchema.parse);
+    const user = await requireRole(event, ADMIN_ROLES);
+    const body = await parseBody(event, regenerateSchema);
+    const student = await findStudentOr404(event);
 
-    const student = await prisma.student.findUnique({ where: { uuid } });
-    if (!student) {
-        throw createError({
-            statusCode: 404,
-            statusMessage: "Siswa tidak ditemukan",
+    if (student.status !== "active") {
+        logger.warn("qr", "Generate QR ditolak: siswa nonaktif", {
+            ...requestContext(event),
+            studentId: student.id,
         });
+        throw appError(409, "Siswa nonaktif tidak dapat dibuatkan QR. Aktifkan siswa terlebih dahulu.");
     }
 
-    const graceDays = Number(await getSettingValue("qr_grace_period_hari"));
-    const gracePeriodUntil = new Date();
-    gracePeriodUntil.setDate(gracePeriodUntil.getDate() + graceDays);
-
-    // QR aktif yang sekarang (kalau ada) -> masuk masa tenggang
-    const existingActive = await prisma.qrCode.findFirst({
-        where: {
-            relatedTo: "students",
+    const grace = await qrGraceUntil();
+    const result = await prisma.$transaction(async (tx) => {
+        const previous = await moveActiveQrToGrace(tx, student.id, grace.until);
+        const reason = body.reason || (previous ? "Generate QR baru" : "Generate QR pertama kali");
+        const qr = await issueStudentQr(tx, {
             studentId: student.id,
-            status: "active",
-            deleted: false,
-        },
-    });
-
-    if (existingActive) {
-        await prisma.qrCode.update({
-            where: { id: existingActive.id },
-            data: { status: "grace_period", gracePeriodUntil },
+            token: generateQrToken(),
+            generatedBy: user.id,
+            reason,
         });
-    }
-
-    const newToken = generateQrToken();
-    const newQr = await prisma.qrCode.create({
-        data: {
-            relatedTo: "students",
-            studentId: student.id,
-            token: newToken,
-            status: "active",
-            generatedBy: session.user.id,
-            reason:
-                body.reason ||
-                (existingActive ? "Regenerate QR" : "Generate QR pertama kali"),
-        },
+        await tx.auditLog.create({
+            data: {
+                teacherId: user.id,
+                actionType: "regenerate_qr",
+                entityType: "student",
+                entityId: student.id,
+                beforeValue: { qrCodeId: previous?.id ?? null },
+                afterValue: { qrCodeId: qr.id },
+                reason,
+            },
+        });
+        return { qr, previous };
     });
 
-    await saveQrImage(newQr.uuid, newToken);
+    await saveQrImageSafe(result.qr.uuid, result.qr.token);
 
-    await prisma.student.update({
-        where: { id: student.id },
-        data: { hasQr: true },
+    logger.info("qr", "QR siswa dibuat", {
+        ...requestContext(event),
+        studentId: student.id,
+        qrId: result.qr.id,
+        qrLamaMasaTenggang: result.previous?.id ?? null,
     });
 
-    await prisma.auditLog.create({
-        data: {
-            teacherId: session.user.id,
-            actionType: "regenerate_qr",
-            entityType: "student",
-            entityId: student.id,
-            beforeValue: { qrCodeId: existingActive?.id ?? null },
-            afterValue: { qrCodeId: newQr.id },
-            reason:
-                body.reason ||
-                (existingActive ? "Regenerate QR" : "Generate QR pertama kali"),
-        },
-    });
-
-    return { qrUuid: newQr.uuid };
+    return {
+        qrUuid: result.qr.uuid,
+        message: result.previous
+            ? `QR baru dibuat. QR lama masih bisa dipakai selama ${grace.days} hari.`
+            : "QR berhasil dibuat.",
+    };
 });

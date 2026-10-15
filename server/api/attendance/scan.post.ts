@@ -1,117 +1,135 @@
 import { z } from "zod";
-import dayjs from "dayjs";
 
-const scanSchema = z.object({
-    token: z.string().min(1),
-    deviceInfo: z.string().optional(),
-});
+const scanSchema = z
+    .object({
+        token: z
+            .string({ error: "QR tidak terbaca." })
+            .trim()
+            .min(1, "QR tidak terbaca.")
+            .max(200, "QR tidak terdaftar di sistem."),
+        mode: z.enum(["otomatis", "pulang_awal"], { error: "Mode scan tidak dikenal." }).default("otomatis"),
+        alasan: z
+            .string({ error: "Alasan harus berupa teks." })
+            .trim()
+            .max(255, "Alasan maksimal 255 karakter.")
+            .optional(),
+        sumber: z.enum(["kamera", "usb"], { error: "Sumber scan tidak dikenal." }).default("kamera"),
+        deviceInfo: z.string().max(500).optional(),
+    })
+    .superRefine((v, ctx) => {
+        if (v.mode === "pulang_awal" && (!v.alasan || v.alasan.length < 3)) {
+            ctx.addIssue({
+                code: "custom",
+                path: ["alasan"],
+                message: "Alasan izin pulang awal wajib diisi (minimal 3 karakter).",
+            });
+        }
+    });
 
-function hitungStatusMasuk(
-    waktuScan: Date,
-    jamMasukGlobal: string,
-    toleransi: number,
-): "hadir" | "terlambat" {
-    const [h, m] = jamMasukGlobal.split(":").map(Number);
-    const batasWaktu = dayjs(waktuScan)
-        .startOf("day")
-        .hour(h)
-        .minute(m + toleransi);
-    return dayjs(waktuScan).isAfter(batasWaktu) ? "terlambat" : "hadir";
-}
-
+// Scan kartu QR siswa: absen masuk / pulang (semua role yang login)
 export default defineEventHandler(async (event) => {
-    await requireUserSession(event);
-    const body = await readValidatedBody(event, scanSchema.parse);
+    const user = await requireAuth(event);
+    const body = await parseBody(event, scanSchema);
+    const ctx = { ...requestContext(event), mode: body.mode, sumber: body.sumber };
 
-    const qr = await prisma.qrCode.findFirst({
-        where: {
-            token: body.token,
-            relatedTo: "students",
-            deleted: false,
-            OR: [
-                { status: "active" },
-                {
-                    status: "grace_period",
-                    gracePeriodUntil: { gte: new Date() },
-                },
-            ],
-        },
-    });
-
-    if (!qr || !qr.studentId) {
-        throw createError({ statusCode: 404, statusMessage: "QR tidak valid" });
-    }
-
-    const student = await prisma.student.findUnique({
-        where: { id: qr.studentId },
-    });
-    if (!student || student.deleted) {
-        throw createError({
-            statusCode: 404,
-            statusMessage: "Siswa tidak ditemukan",
-        });
-    }
-
-    if (student.status !== "active") {
-        throw createError({
-            statusCode: 403,
-            statusMessage: `Siswa nonaktif: ${student.statusReason || "-"}`,
-        });
-    }
-
-    const today = toDbDate(dayjs().format("YYYY-MM-DD"));
     const now = new Date();
+    const rules = await loadScanRules(now);
+    assertSchoolDay(rules, ctx);
 
-    const jamMasukGlobal = await getSettingValue("jam_masuk_global");
-    const toleransi = Number(await getSettingValue("toleransi_telat_menit"));
-
-    const existing = await prisma.attendance.findUnique({
-        where: { studentId_tanggal: { studentId: student.id, tanggal: today } },
-    });
-
-    const studentInfo = {
-        nama: student.nama,
-        nisn: student.nisn,
-        kelas: student.kelasSekarang,
+    const { qrId, student, view, info: qrInfo } = await resolveStudentByToken(body.token, ctx);
+    const logCtx = { ...ctx, qrId, studentId: student.id };
+    assertJenjangMasuk(rules, student.jenjang, logCtx, { student: view });
+    const pencatat: Pencatat = {
+        olehId: user.id,
+        metode: "qr",
+        catatan: body.mode === "pulang_awal" ? body.alasan! : null,
+        deviceInfo: body.deviceInfo,
     };
 
-    // Kasus 1: belum ada record sama sekali -> absen masuk baru
-    if (!existing) {
-        const statusUtama = hitungStatusMasuk(now, jamMasukGlobal, toleransi);
-        const attendance = await prisma.attendance.create({
-            data: {
-                studentId: student.id,
-                tanggal: today,
-                jamMasukAsli: now,
-                statusUtama,
-                deviceInfo: body.deviceInfo,
-            },
-        });
-        return { type: "masuk", student: studentInfo, waktu: now, attendance };
+    const result = await withScanRetry(() =>
+        prisma.$transaction(async (tx) => {
+            const existing = await findTodayAttendance(tx, student.id, rules);
+            const keputusan = tentukanAksiScan(existing, student, body.mode, rules, now, { student: view });
+
+            if (keputusan.aksi === "sudah_tercatat") {
+                const att = await tx.attendance.findUniqueOrThrow({
+                    where: { id: existing!.id },
+                    include: attendanceViewInclude,
+                });
+                return { keputusan, att };
+            }
+            if (keputusan.aksi === "masuk") {
+                return { keputusan, att: await catatMasuk(tx, existing, student.id, now, rules, pencatat) };
+            }
+
+            const att = await catatPulang(tx, existing!, now, keputusan.pulangAwal, pencatat);
+            if (keputusan.pulangAwal) {
+                await tx.auditLog.create({
+                    data: {
+                        teacherId: user.id,
+                        actionType: "izin_pulang_awal",
+                        entityType: "attendance",
+                        entityId: att.id,
+                        beforeValue: { jamPulang: null },
+                        afterValue: { jamPulang: now, pulangAwal: true, metode: "qr" },
+                        reason: body.alasan,
+                    },
+                });
+            }
+            return { keputusan, att };
+        }),
+    ).catch(logPenolakan("scan", "Scan", logCtx));
+
+    const { keputusan, att } = result;
+    const today = attendanceView(att, user, rules, now);
+
+    if (keputusan.aksi === "sudah_tercatat") {
+        const waktu = keputusan.jenis === "masuk" ? att.jamMasukAsli! : att.jamPulangAsli!;
+        logger.info("scan", "Scan ganda diabaikan: sudah tercatat", { ...logCtx, attendanceId: att.id });
+        return {
+            result: "sudah_tercatat" as const,
+            jenis: keputusan.jenis,
+            message: `${student.nama} sudah tercatat ${keputusan.jenis} pukul ${formatJamWib(waktu)}.`,
+            student: view,
+            waktu,
+            today,
+            info: qrInfo,
+        };
     }
 
-    // Kasus 2: record ada tapi jam masuk kosong (hasil Cron A/B) -> siswa baru scan, isi jam masuk aslinya
-    if (!existing.jamMasukAsli) {
-        const statusUtama = hitungStatusMasuk(now, jamMasukGlobal, toleransi);
-        const attendance = await prisma.attendance.update({
-            where: { id: existing.id },
-            data: { jamMasukAsli: now, statusUtama },
+    if (keputusan.aksi === "masuk") {
+        const status = hitungStatusMasuk(now, rules);
+        logger.info("scan", "Absen masuk", {
+            ...logCtx,
+            attendanceId: att.id,
+            status: status.status,
+            menitTerlambat: status.menitTerlambat,
         });
-        return { type: "masuk", student: studentInfo, waktu: now, attendance };
+        return {
+            result: "masuk" as const,
+            jenis: "masuk" as const,
+            message:
+                status.status === "terlambat"
+                    ? `Absen masuk tercatat, terlambat ${status.menitTerlambat} menit.`
+                    : "Absen masuk tercatat, tepat waktu.",
+            student: view,
+            waktu: now,
+            today,
+            info: qrInfo,
+        };
     }
 
-    // Kasus 3: sudah ada jam masuk, belum ada jam pulang -> absen pulang
-    if (!existing.jamPulangAsli) {
-        const attendance = await prisma.attendance.update({
-            where: { id: existing.id },
-            data: { jamPulangAsli: now },
-        });
-        return { type: "pulang", student: studentInfo, waktu: now, attendance };
-    }
-
-    // Kasus 4: sudah lengkap keduanya -> tolak
-    throw createError({
-        statusCode: 400,
-        statusMessage: "Sudah absen lengkap hari ini",
+    logger.info("scan", keputusan.pulangAwal ? "Absen pulang awal (izin)" : "Absen pulang", {
+        ...logCtx,
+        attendanceId: att.id,
     });
+    return {
+        result: "pulang" as const,
+        jenis: "pulang" as const,
+        message: keputusan.pulangAwal ? "Izin pulang awal tercatat." : "Absen pulang tercatat.",
+        student: view,
+        waktu: now,
+        today,
+        info: [keputusan.info, qrInfo].filter(Boolean).join(" ") || null,
+    };
 });

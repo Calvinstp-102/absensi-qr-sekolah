@@ -1,6 +1,7 @@
 <template>
     <div class="flex min-h-screen bg-gray-100">
-        <aside class="w-64 bg-primary-700 text-white flex flex-col shrink-0">
+        <!-- Mode layar penuh halaman Scan (kiosk): sidebar disembunyikan -->
+        <aside v-show="!kiosk" class="w-64 bg-primary-700 text-white flex flex-col shrink-0">
             <div class="px-6 py-6 border-b border-primary-600">
                 <p class="font-heading font-bold text-base leading-snug">
                     Yayasan Pendidikan Adventus Serang
@@ -71,6 +72,23 @@
                     Scan
                 </NuxtLink>
                 <NuxtLink
+                    to="/laporan"
+                    class="nav-link"
+                    :class="{ 'nav-link-active': route.path.startsWith('/laporan') }"
+                >
+                    <svg
+                        class="w-[18px] h-[18px]"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                    >
+                        <path d="M14 3H6a2 2 0 00-2 2v14a2 2 0 002 2h12a2 2 0 002-2V9z" />
+                        <path d="M14 3v6h6M8 17v-3M12 17v-6M16 17v-2" />
+                    </svg>
+                    Laporan
+                </NuxtLink>
+                <NuxtLink
                     v-if="user?.role === 'superadmin' || user?.role === 'admin'"
                     to="/guru"
                     class="nav-link"
@@ -92,6 +110,7 @@
                     Manajemen Guru
                 </NuxtLink>
                 <NuxtLink
+                    v-if="user?.role === 'superadmin' || user?.role === 'admin'"
                     to="/log-aktivitas"
                     class="nav-link"
                     :class="{
@@ -131,43 +150,100 @@
                 </NuxtLink>
             </nav>
 
-            <div class="px-5 py-4 border-t border-primary-600">
-                <p class="text-sm font-medium truncate">{{ user?.nama }}</p>
-                <p class="text-xs text-primary-200 mb-2 capitalize">
-                    {{ roleLabel }}
-                </p>
-                <button
-                    @click="handleLogout"
-                    class="text-xs text-accent-400 hover:text-accent-300 font-medium"
+            <div class="px-3 py-3 border-t border-primary-600">
+                <NuxtLink
+                    to="/akun"
+                    class="flex items-center gap-3 px-2 py-2 rounded-lg hover:bg-white/10 transition-colors"
+                    :class="{ 'bg-white/15': route.path === '/akun' }"
+                    title="Akun Saya"
                 >
-                    Logout
+                    <UserAvatar
+                        :nama="user?.nama ?? ''"
+                        :uuid="user?.uuid"
+                        :foto-path="user?.fotoPath"
+                        size="sm"
+                        color-class="bg-primary-600 text-white"
+                    />
+                    <div class="min-w-0">
+                        <p class="text-sm font-medium truncate">
+                            {{ user?.nama }}
+                        </p>
+                        <p class="text-xs text-primary-200">{{ roleLabel }}</p>
+                    </div>
+                </NuxtLink>
+                <button
+                    type="button"
+                    class="mt-1 w-full flex items-center gap-2 px-2 py-2 rounded-lg text-xs text-accent-400 hover:text-accent-300 hover:bg-white/5 font-medium"
+                    :disabled="isLoggingOut"
+                    @click="handleLogout"
+                >
+                    <svg
+                        class="w-4 h-4"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                    >
+                        <path
+                            d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9"
+                        />
+                    </svg>
+                    {{ isLoggingOut ? "Keluar..." : "Keluar" }}
                 </button>
             </div>
         </aside>
 
-        <main class="flex-1 p-8 overflow-auto">
+        <main class="flex-1 overflow-auto" :class="kiosk ? 'p-4' : 'p-8'">
             <slot />
         </main>
     </div>
 </template>
 
 <script setup lang="ts">
-const { user, clear } = useUserSession();
+const { user, roleLabel } = useAuth();
+const { clear } = useUserSession();
+const { confirm } = useConfirm();
+const toast = useToast();
+const api = useApi();
 const route = useRoute();
+const router = useRouter();
+const kiosk = useState<boolean>("scan-kiosk", () => false);
 
-const roleLabel = computed(() => {
-    const map: Record<string, string> = {
-        admin: "Admin",
-        guru_piket: "Guru Piket",
-        wali_kelas: "Wali Kelas",
-    };
-    return user.value?.role ? (map[user.value.role] ?? user.value.role) : "";
-});
+// Diarahkan ke sini oleh middleware karena role tidak berhak membuka halaman
+watch(
+    () => route.query.denied,
+    (denied) => {
+        if (!denied || !import.meta.client) return;
+        toast.warning(
+            "Akses ditolak",
+            "Anda tidak memiliki akses ke halaman tersebut.",
+        );
+        const { denied: _, ...query } = route.query;
+        router.replace({ query });
+    },
+    { immediate: true },
+);
 
+const isLoggingOut = ref(false);
 async function handleLogout() {
-    await $fetch("/api/auth/logout", { method: "POST" });
-    await clear();
-    await navigateTo("/login");
+    const ok = await confirm({
+        title: "Keluar dari aplikasi?",
+        message: "Anda perlu login kembali untuk menggunakan sistem absensi.",
+        confirmText: "Ya, Keluar",
+    });
+    if (!ok) return;
+
+    isLoggingOut.value = true;
+    try {
+        await api("/api/auth/logout", { method: "POST" });
+    } catch {
+        // Tetap lanjut keluar di sisi browser walau server tidak merespons
+    } finally {
+        await clear().catch(() => {});
+        isLoggingOut.value = false;
+        toast.info("Anda telah keluar", "Sampai jumpa kembali!");
+        await navigateTo("/login");
+    }
 }
 </script>
 

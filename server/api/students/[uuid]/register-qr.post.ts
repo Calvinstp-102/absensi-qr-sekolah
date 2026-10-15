@@ -1,86 +1,103 @@
 import { z } from "zod";
 
 const registerSchema = z.object({
-    token: z.string().min(1),
-    reason: z.string().optional(),
+    token: z
+        .string({ error: "QR belum terbaca." })
+        .trim()
+        .min(1, "QR belum terbaca.")
+        .max(191, "Isi QR terlalu panjang. Gunakan kartu QR absensi."),
+    reason: z
+        .string({ error: "Alasan harus berupa teks." })
+        .trim()
+        .max(255, "Alasan maksimal 255 karakter.")
+        .nullish()
+        .transform((v) => v || "Daftarkan kartu QR yang sudah ada"),
 });
 
 export default defineEventHandler(async (event) => {
-    const session = await requireUserSession(event);
-    const uuid = getRouterParam(event, "uuid");
-    const body = await readValidatedBody(event, registerSchema.parse);
+    const user = await requireRole(event, ADMIN_ROLES);
+    const body = await parseBody(event, registerSchema);
+    const student = await findStudentOr404(event);
+    const ctx = { ...requestContext(event), studentId: student.id };
 
-    const student = await prisma.student.findUnique({ where: { uuid } });
-    if (!student) {
-        throw createError({
-            statusCode: 404,
-            statusMessage: "Siswa tidak ditemukan",
-        });
+    if (student.status !== "active") {
+        logger.warn("qr", "Daftarkan QR ditolak: siswa nonaktif", ctx);
+        throw appError(409, "Siswa nonaktif tidak dapat didaftarkan QR. Aktifkan siswa terlebih dahulu.");
     }
 
-    const existingToken = await prisma.qrCode.findFirst({
-        where: { token: body.token, deleted: false },
+    // Token unik di database, termasuk QR yang sudah dihapus/kedaluwarsa
+    const existing = await prisma.qrCode.findUnique({
+        where: { token: body.token },
+        include: { student: { select: { nama: true, jenjang: true, kelasSekarang: true, deleted: true } } },
     });
-    if (existingToken) {
-        throw createError({
-            statusCode: 400,
-            statusMessage:
-                "QR ini sudah terdaftar sebelumnya (untuk siswa lain atau siswa ini sendiri)",
-        });
+    const ownedBySelf = existing?.relatedTo === "students" && existing.studentId === student.id;
+
+    if (existing && !ownedBySelf) {
+        logger.warn("qr", "Daftarkan QR ditolak: kartu milik pihak lain", { ...ctx, qrId: existing.id });
+        const other = existing.student;
+        throw appError(
+            409,
+            other && !other.deleted
+                ? `Kartu QR ini sudah terdaftar untuk siswa lain: ${other.nama} (${formatKelas(other.jenjang, other.kelasSekarang)}).`
+                : "Kartu QR ini pernah dipakai akun lain sehingga tidak dapat didaftarkan. Gunakan kartu lain atau Generate QR.",
+        );
+    }
+    if (existing && ownedBySelf && existing.status === "active" && !existing.deleted) {
+        throw appError(409, "Kartu QR ini sudah menjadi QR aktif siswa ini.");
     }
 
-    const graceDays = Number(await getSettingValue("qr_grace_period_hari"));
-    const gracePeriodUntil = new Date();
-    gracePeriodUntil.setDate(gracePeriodUntil.getDate() + graceDays);
-
-    const existingActive = await prisma.qrCode.findFirst({
-        where: {
-            relatedTo: "students",
-            studentId: student.id,
-            status: "active",
-            deleted: false,
-        },
-    });
-
-    if (existingActive) {
-        await prisma.qrCode.update({
-            where: { id: existingActive.id },
-            data: { status: "grace_period", gracePeriodUntil },
+    const grace = await qrGraceUntil();
+    const result = await prisma.$transaction(async (tx) => {
+        const previous = await moveActiveQrToGrace(tx, student.id, grace.until);
+        let qr: { id: number; uuid: string; token: string };
+        if (existing) {
+            // Kartu lama milik siswa ini sendiri (pernah dihapus/kedaluwarsa) -> aktifkan kembali
+            qr = await tx.qrCode.update({
+                where: { id: existing.id },
+                data: {
+                    status: "active",
+                    deleted: false,
+                    gracePeriodUntil: null,
+                    generatedBy: user.id,
+                    reason: body.reason,
+                },
+                select: { id: true, uuid: true, token: true },
+            });
+            await tx.student.update({ where: { id: student.id }, data: { hasQr: true } });
+        } else {
+            qr = await issueStudentQr(tx, {
+                studentId: student.id,
+                token: body.token,
+                generatedBy: user.id,
+                reason: body.reason,
+            });
+        }
+        await tx.auditLog.create({
+            data: {
+                teacherId: user.id,
+                actionType: "register_qr",
+                entityType: "student",
+                entityId: student.id,
+                beforeValue: { qrCodeId: previous?.id ?? null },
+                afterValue: { qrCodeId: qr.id, diaktifkanKembali: !!existing },
+                reason: body.reason,
+            },
         });
-    }
-
-    const reasonText =
-        body.reason || "Daftarkan QR yang sudah ada (kartu fisik eksisting)";
-
-    const newQr = await prisma.qrCode.create({
-        data: {
-            relatedTo: "students",
-            studentId: student.id,
-            token: body.token,
-            status: "active",
-            generatedBy: session.user.id,
-            reason: reasonText,
-        },
+        return { qr, previous };
     });
 
-    await saveQrImage(newQr.uuid, body.token);
+    await saveQrImageSafe(result.qr.uuid, result.qr.token);
 
-    await prisma.student.update({
-        where: { id: student.id },
-        data: { hasQr: true },
+    logger.info("qr", existing ? "Kartu QR lama diaktifkan kembali" : "Kartu QR didaftarkan", {
+        ...ctx,
+        qrId: result.qr.id,
+        qrLamaMasaTenggang: result.previous?.id ?? null,
     });
 
-    await prisma.auditLog.create({
-        data: {
-            teacherId: session.user.id,
-            actionType: "register_qr",
-            entityType: "student",
-            entityId: student.id,
-            beforeValue: { qrCodeId: existingActive?.id ?? null },
-            afterValue: { qrCodeId: newQr.id },
-            reason: reasonText,
-        },
-    });
-
-    return { qrUuid: newQr.uuid };
+    return {
+        qrUuid: result.qr.uuid,
+        message: existing
+            ? "Kartu QR lama siswa ini diaktifkan kembali."
+            : "Kartu QR berhasil didaftarkan.",
+    };
 });
